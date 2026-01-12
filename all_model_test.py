@@ -99,70 +99,83 @@ MODELS_CONFIG = [
 # 模拟模式 (True=不花钱测试流程, False=真实请求)
 MOCK_MODE = False 
 
+# # ================= 核心工具：按标点切分 =================
+def split_text_by_punctuation(text):
+    """
+    将文本按标点符号切分，同时保留标点符号。
+    例如输入: "你好，世界。" 
+    输出: ['你好', '，', '世界', '。']
+    """
+    if not isinstance(text, str):
+        text = str(text)
+        
+    # 定义标点符号的正则模式 (包含全角和半角常见标点)
+    # 这里的 () 是捕获组，re.split 会保留捕获组内的内容作为单独的列表项
+    pattern = r'([，,。\.？\?！!；;：:])'
+    
+    # 切分
+    parts = re.split(pattern, text)
+    
+    # 去除空字符串 (re.split 有时会在首尾产生空串)
+    return [p for p in parts if p.strip() != '']
+
+def is_punctuation(text):
+    """判断一个字符串是否纯粹是标点符号"""
+    return re.match(r'^[，,。\.？\?！!；;：:]+$', text.strip()) is not None
+
 # ================= 辅助函数：清洗数据 =================
 def clean_gloss_text(text):
+    """
+    清洗 gloss 文本。
+    【重要修改】：因为我们在外层逻辑手动保留了原文标点，
+    这里我们要【彻底删除】模型可能生成的标点，防止双重标点。
+    只保留：汉字、英文字母、数字、空格。
+    """
     if pd.isna(text) or str(text).strip() == "":
         return ""
     
-    # 获取字符串并去除首尾空格
     text_str = str(text).strip()
-
-    # 1. 去除 Markdown 代码块标记 (例如 ```json ... ``` 或 ``` ... ```)
     text_str = re.sub(r'^```(json)?|```$', '', text_str, flags=re.IGNORECASE | re.MULTILINE).strip()
     
-    # 定义一个内部函数，用来处理解析后的数据（无论是来自 json 还是 ast）
     def extract_from_data(data):
-        # 如果是字典 (例如 {"": ["你好", "世界"]} 或 {"gloss": [...]})
         if isinstance(data, dict):
-            # 遍历字典所有的值，找到第一个是 list 的值
             for value in data.values():
                 if isinstance(value, list):
-                    # 将列表里的元素转成字符串并拼接
-                    return "".join([str(x) for x in value])
-            # 如果字典里没有 list，但有字符串值，尝试直接返回字符串
+                    return " ".join([str(x).strip() for x in value if str(x).strip()])
             for value in data.values():
                 if isinstance(value, str):
-                    return value
-                    
-        # 如果本身就是列表 (例如 ["你好", "世界"])
+                    return value.strip()
         elif isinstance(data, list):
-            return "".join([str(x) for x in data])
-            
+            return " ".join([str(x).strip() for x in data if str(x).strip()])
         return None
 
-    # 2. 尝试使用标准 json 库解析
+    # 尝试解析 JSON/AST
     try:
         data = json.loads(text_str)
-        result = extract_from_data(data)
-        if result is not None:
-            return result
-    except json.JSONDecodeError:
-        pass 
+        res = extract_from_data(data)
+        if res: text_str = res # 如果解析成功，更新 text_str 为提取出的内容
+    except: pass
 
-    # 3. 尝试使用 ast.literal_eval (处理单引号等非标准 JSON)
     try:
         data = ast.literal_eval(text_str)
-        result = extract_from_data(data)
-        if result is not None:
-            return result
-    except (ValueError, SyntaxError):
-        pass
+        res = extract_from_data(data)
+        if res: text_str = res
+    except: pass
 
-    # 4. 暴力清洗 (最后的兜底，针对截断的 JSON 或完全解析失败的情况)
-    # 策略：提取所有引号内的内容，而不是简单删除标点
-    # 匹配 "词" 或 '词'
+    # 暴力清洗：如果解析失败，尝试提取引号内容
     matches = re.findall(r'["\'](.*?)["\']', text_str)
     if matches:
-        # 过滤掉可能的 Key (比如 "gloss", "json" 或者空字符串)
-        filtered_matches = [m for m in matches if m not in ['gloss', 'json', '', ' ']]
-        if filtered_matches:
-            return "".join(filtered_matches)
+        filtered = [m.strip() for m in matches if m.strip() not in ['gloss', 'json', '', ' ']]
+        if filtered:
+            text_str = " ".join(filtered)
 
-    # 5. 如果连引号都提取不到，说明可能是纯文本带了一些奇怪符号
-    # 直接删除 JSON 常见符号，保留文字
-    cleaned = re.sub(r'[{"\'}[]:,]', '', text_str)
-    cleaned = cleaned.replace('gloss', '').replace('json', '')
-    cleaned = re.sub(r'\s+', '', cleaned) # 去除所有空格，变成连贯句子
+    # --- 最终清洗 ---
+    # 替换掉所有 非单词字符 (保留中文、英文、数字、下划线) 和 空格
+    # 这一步会把逗号、句号等标点全部删掉，确保只留下 Gloss 词汇
+    cleaned = re.sub(r'[^\w\s\u4e00-\u9fa5]', ' ', text_str) 
+    
+    # 合并多余空格
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     
     return cleaned
 
@@ -342,7 +355,7 @@ def main():
     system_prompt = load_prompt()
     if system_prompt is None:
         print("⛔️ 程序终止：必须提供 prompt 模板文件。")
-        return # 直接退出
+        return 
 
     if not os.path.exists(INPUT_FILE):
         print(f"❌ 找不到文件 {INPUT_FILE}")
@@ -358,24 +371,26 @@ def main():
         print(f"❌ CSV 中找不到列名 '{target_column}'。现有列名: {list(df.columns)}")
         return
 
-    # 2. 读取数据 (测试时只取前2行，正式跑请去掉 .head(rows))
+    # 2. 读取数据 (测试时只取前几行，正式跑请去掉 .head(rows))
     rows = 2 # 测试用
     df_subset = df.head(rows).copy()
     # df_subset = df.copy() # 正式跑用这行
 
     # --- 1. 数据收集阶段 ---
-    # 我们不再直接存 Excel 行，而是存结构化数据
     collected_data = [] 
 
-    print(f"✅ 开始处理 {len(df_subset)} 条数据...")
+    print(f"✅ 开始处理 {len(df_subset)} 条数据 (分段翻译模式)...")
 
     for index, row in df_subset.iterrows():
         source_text = row[target_column]
         if pd.isna(source_text) or str(source_text).strip() == "":
             continue
 
-        print(f"\nProcessing [{index+1}/{len(df_subset)}]: {source_text[:10]}...")
+        print(f"\nProcessing [{index+1}/{len(df_subset)}]: {source_text[:15]}...")
         
+        # 1. 切分原文：['直至下午5時', '，', '錄得氣溫30度', '，', '相對濕度百分之85']
+        segments = split_text_by_punctuation(source_text)
+
         # 单条数据的结构
         item_data = {
             "input": source_text,
@@ -385,48 +400,81 @@ def main():
         for config in MODELS_CONFIG:
             print(f"  -> {config['name']}... ", end="", flush=True)
 
-            clean_text = "" # 初始化结果变量
+            final_parts = [] # 存储这一轮模型的翻译片段
+            sentence_has_error = False # 标记整句中是否有片段出错
 
-            try:
-                # 【尝试执行】
-                # 这里调用函数，如果失败会自动重试 3 次
-                # 如果 3 次都失败，这里会直接跳到 except 块，不会往下执行
-                res = call_translation_api_generic(str(source_text), system_prompt, config)
+            # 2. 遍历切分后的片段
+            for seg in segments:
+                # A. 如果是标点，直接原样保留，不发给模型
+                if is_punctuation(seg):
+                    final_parts.append(seg) 
+                    continue
+                
+                # B. 如果是纯空格，保留或跳过
+                if not seg.strip():
+                    final_parts.append(seg)
+                    continue
 
-                if res['status'] == 'success':
-                    # 成功拿到结果
-                    clean_text = clean_gloss_text(res['hksl'])
-                    print("✅") 
+                # C. 如果是文本，调用 API (植入详细的错误处理)
+                try:
+                    # 【尝试执行】
+                    # 这里调用函数，如果失败会自动重试 (由 tenacity 控制)
+                    res = call_translation_api_generic(str(seg), system_prompt, config)
+
+                    if res['status'] == 'success' or res['status'] == 'mock':
+                        # 成功拿到结果，清洗数据
+                        clean_seg_text = clean_gloss_text(res['hksl'])
+                        final_parts.append(clean_seg_text)
+                    else:
+                        # API 通了，但返回了业务错误 (如 JSON 结构不对)
+                        error_text = f"[Logic Error: {res['hksl']}]"
+                        final_parts.append(error_text)
+                        sentence_has_error = True
+                        logging.error(f"模型: {config['name']} | 片段: {seg} | 逻辑错误: {res['hksl']}")
+                
+                except Exception as e:
+                    # --- 彻底失败 (重试耗尽 或 网络中断) ---
+                    import tenacity 
+                    
+                    real_error = e
+                    # 尝试拆开“快递盒子”，取出真正的错误原因
+                    if isinstance(e, tenacity.RetryError):
+                        real_error = e.last_attempt.exception()
+                    
+                    error_msg_str = str(real_error)
+                    
+                    # 记录错误信息以便写入 Excel (用方括号包起来，方便后续筛选)
+                    final_parts.append(f"[API Fail: {error_msg_str}]")
+                    sentence_has_error = True
+                    
+                    # 记录详细日志
+                    logging.error(f"模型: {config['name']} | 片段: {seg} | 异常详情: {error_msg_str}")
+
+            # 3. 智能拼接结果 (处理空格)
+            full_translation = ""
+            for i, part in enumerate(final_parts):
+                # 如果当前部分是标点
+                if is_punctuation(part):
+                    full_translation += part
                 else:
-                    # API 通了，但返回了业务错误 (如 JSON 结构不对)
-                    clean_text = f"❌ Logic Error: {res['hksl']}"
-                    print(f"⚠️ (Logic Error)")
-                    logging.error(f"模型: {config['name']} | 逻辑错误: {res['hksl']}")
-            
-            except Exception as e:
-                # --- 彻底失败 (重试耗尽 或 网络中断) ---
-                import tenacity # 确保引入了 tenacity
-                
-                real_error = e
-                # 尝试拆开“快递盒子”，取出真正的错误原因
-                if isinstance(e, tenacity.RetryError):
-                    real_error = e.last_attempt.exception()
-                
-                error_msg_str = str(real_error)
-                
-                # 在终端打印更清晰的错误
-                print(f"❌ {config['name']} 失败: {error_msg_str}") 
-                
-                # 记录错误信息以便写入 Excel
-                clean_text = f"❌ Error: {error_msg_str}"
-                
-                # 记录详细日志
-                logging.error(f"模型: {config['name']} | 原文: {source_text[:10]}... | 异常详情: {error_msg_str}")
+                    # 如果是文本
+                    # 只有当前一个部分也是文本(且不是空)时，才加空格分隔
+                    # 逻辑：Gloss 词之间要有空格，但 Gloss 和标点之间通常不需要(或视情况而定)
+                    if i > 0 and not is_punctuation(final_parts[i-1]) and final_parts[i-1].strip():
+                        full_translation += " " + part
+                    else:
+                        full_translation += part
 
-            # 5. 存储结果 (无论成功与否，clean_text 都有值)
+            # 4. 打印该模型本句的状态
+            if sentence_has_error:
+                print("⚠️ (Partial Error)") # 有部分片段失败
+            else:
+                print("✅") # 完美
+
+            # 5. 存储结果
             item_data["results"].append({
                 "model_name": config['name'],
-                "infer_text": clean_text
+                "infer_text": full_translation
             })
             
             if not MOCK_MODE: 
