@@ -85,6 +85,23 @@ MODELS_CONFIG = [
 ]
 
 # ================= 核心工具函数 =================
+# ... (你的 MODELS_CONFIG 定义代码保持不变) ...
+
+def get_model_config(target_name):
+    """
+    根据名字获取配置，没传名字默认用第一个
+    """
+    # 1. 如果前端没传名字，或者传的是空，默认使用列表里的第一个
+    if not target_name:
+        return MODELS_CONFIG[0]
+
+    # 2. 遍历列表查找匹配的名字
+    for config in MODELS_CONFIG:
+        if config["name"] == target_name:
+            return config
+            
+    # 3. 如果找不到，返回 None (后面会处理报错)
+    return None
 
 def load_prompt():
     """
@@ -270,71 +287,58 @@ def call_translation_api_generic(text, system_prompt, config):
 
 # ================= Web 接口逻辑 =================
 
-def process_request_logic(user_input_text):
+def process_request_logic(text, config):
     """
-    处理单个请求的核心流程：
-    切分 -> 翻译 -> 清洗 -> 查库 -> 组装
+    实际处理翻译/请求的逻辑
+    :param text: 用户输入的文本
+    :param config: 选中的模型配置字典 (包含 url, key, model_id 等)
     """
-    system_prompt = load_prompt()
-    segments = split_text_by_punctuation(user_input_text)
     
-    final_result_list = []
+    # 从 config 中提取参数
+    api_url = config["url"]
+    api_key = config["key"]
+    model_id = config["model_id"]
+    model_params = config["params"]
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+
+    payload = {
+        "model": model_id,
+        "messages": [
+            {"role": "system", "content": "你是一个翻译助手。"}, # 你的 System Prompt
+            {"role": "user", "content": text}
+        ],
+        "stream": False,
+        **model_params # 展开合并其他参数 (如 temperature)
+    }
+
+    # 发送请求
+    import requests # 确保导入了 requests
+    response = requests.post(api_url, headers=headers, json=payload)
     
-    # 默认使用配置列表里的第一个模型
-    current_config = MODELS_CONFIG[0] 
-
-    for seg in segments:
-        # 1. 如果是标点，直接返回
-        if is_punctuation(seg):
-            final_result_list.append({
-                "type": "punctuation",
-                "word": seg,
-                "id": None
-            })
-            continue
-        
-        # 2. 如果是文本，调用翻译
-        try:
-            # 调用 LLM
-            res = call_translation_api_generic(seg, system_prompt, current_config)
-            
-            # 清洗 (去除模型可能产生的标点)
-            cleaned_gloss_str = clean_gloss_text(res['hksl'])
-            
-            # 3. 拆解 Gloss 句子，逐词查 ID
-            # 例如 "下午 5 时" -> ["下午", "5", "时"]
-            gloss_words = cleaned_gloss_str.split(" ")
-            
-            for word in gloss_words:
-                if not word.strip(): continue
-                
-                # 查库获取 ID
-                word_id = get_id_from_db(word)
-                
-                final_result_list.append({
-                    "type": "gloss",
-                    "word": word,
-                    "id": word_id 
-                })
-                
-        except Exception as e:
-            logging.error(f"Translation failed for segment '{seg}': {e}")
-            # 发生错误时，返回原文并标记 error
-            final_result_list.append({
-                "type": "error",
-                "word": seg,
-                "id": None
-            })
-
-    return final_result_list
+    # 处理响应
+    if response.status_code == 200:
+        res_json = response.json()
+        content = res_json['choices'][0]['message']['content']
+        return {
+            "result": content,
+            "used_model": config["name"] # 返回给前端确认用了哪个模型
+        }
+    else:
+        raise Exception(f"API Error {response.status_code}: {response.text}")
 
 # ================= Flask 路由 =================
-
 @app.route('/api/translate', methods=['POST'])
 def api_translate():
     """
     POST /api/translate
-    Body: { "text": "直至下午5時，錄得氣溫30度。" }
+    Body: { 
+        "text": "直至下午5時，錄得氣溫30度。",
+        "model_name": "deepseek-chat"  <-- 可选参数
+    }
     """
     try:
         data = request.get_json()
@@ -342,14 +346,26 @@ def api_translate():
             return jsonify({"error": "Invalid JSON"}), 400
             
         user_text = data.get('text', '')
+        # 1. 获取前端传来的模型名字 (如果没有传，就是 None)
+        requested_model_name = data.get('model_name') 
         
         if not user_text:
             return jsonify({"error": "No text provided"}), 400
         
-        print(f"📥 收到请求: {user_text}")
+        # 2. 获取对应的配置
+        selected_config = get_model_config(requested_model_name)
         
-        # 执行处理逻辑
-        result_data = process_request_logic(user_text)
+        # 3. 如果名字传错了，找不到配置，报错返回
+        if selected_config is None:
+            return jsonify({
+                "error": f"Model '{requested_model_name}' not supported. Available: {[m['name'] for m in MODELS_CONFIG]}"
+            }), 400
+
+        print(f"📥 收到请求: {user_text}")
+        print(f"🤖 使用模型: {selected_config['name']}")
+        
+        # 4. 【关键】把选中的配置传给处理逻辑
+        result_data = process_request_logic(user_text, selected_config)
         
         return jsonify(result_data)
         
@@ -360,7 +376,11 @@ def api_translate():
 @app.route('/health', methods=['GET'])
 def health_check():
     """健康检查接口"""
-    return jsonify({"status": "ok", "model": MODELS_CONFIG[0]['name']})
+    return jsonify({
+        "status": "ok", 
+        "default_model": MODELS_CONFIG[0]['name'],
+        "supported_models": [m['name'] for m in MODELS_CONFIG] # 告诉前端支持哪些
+    })
 # ================= 启动入口 =================
 
 if __name__ == "__main__":
