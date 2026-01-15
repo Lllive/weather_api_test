@@ -451,6 +451,127 @@ def api_translate():
         logging.error(f"Server Error: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/proxy/content/submit', methods=['POST'])
+def proxy_content_submit():
+    data = request.get_json(silent=True) or {}
+    file_name = (data.get("sheet") or "").strip()
+    print(f"\n\n========== 开始处理 /proxy/content/submit ==========")
+    print(f"sheet={file_name}")
+
+    if not file_name:
+        return jsonify({"detail": "sheet is empty"}), 400
+
+    file_name_with_ext = file_name if file_name.lower().endswith(".csv") else f"{file_name}.csv"
+
+    static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+    csv_path = os.path.join(static_dir, file_name_with_ext)
+
+    if not os.path.exists(csv_path):
+        return jsonify({
+            "detail": f"CSV file '{file_name_with_ext}' not found in static folder. Call /proxy/content/import first."
+        }), 404
+
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            csv_text = f.read()
+        print(f"CSV 文件读取成功: {csv_path}, size={len(csv_text)} chars")
+    except Exception as e:
+        return jsonify({"detail": f"Error reading CSV file: {type(e).__name__}: {e}"}), 500
+
+    dify_base_url = (os.getenv("DIFY_BASE_URL") or "http://100.107.101.114:8081").strip()
+    api_key = os.getenv("DIFY_IMPORT_API_KEY")
+    if not api_key:
+        return jsonify({"detail": "Missing env var: DIFY_IMPORT_API_KEY"}), 500
+
+    upload_url = f"{dify_base_url}/v1/files/upload"
+    upload_headers = {"Authorization": f"Bearer {api_key}"}
+    upload_data = {"user": "abc-123", "type": "document"}
+    files_to_upload = {"file": (file_name_with_ext, csv_text.encode("utf-8"), "text/csv")}
+
+    print(f"开始上传 CSV 到 Dify: {upload_url}")
+    try:
+        upload_resp = requests.post(
+            upload_url,
+            files=files_to_upload,
+            data=upload_data,
+            headers=upload_headers,
+            timeout=60
+        )
+    except Exception as e:
+        return jsonify({"detail": f"Dify file upload request failed: {type(e).__name__}: {e}"}), 502
+
+    if upload_resp.status_code >= 400:
+        return jsonify({"detail": f"Dify file upload failed: {upload_resp.text}"}), upload_resp.status_code
+
+    try:
+        upload_json = upload_resp.json()
+    except Exception as e:
+        return jsonify({"detail": f"Invalid JSON from Dify file upload: {type(e).__name__}: {e}"}), 502
+
+    file_id = upload_json.get("id")
+    if not file_id:
+        return jsonify({"detail": "No file ID returned from Dify file upload"}), 500
+
+    print(f"✓ 文件上传成功, file_id: {file_id}")
+
+    workflow_id = os.getenv("DIFY_IMPORT_WORKFLOW_ID")
+    if not workflow_id:
+        return jsonify({"detail": "Missing env var: DIFY_IMPORT_WORKFLOW_ID"}), 500
+
+    workflow_url = f"{dify_base_url}/v1/workflows/{workflow_id}/run"
+    workflow_body = {
+        "inputs": {
+            "CSV_DATA": {
+                "transfer_method": "local_file",
+                "upload_file_id": file_id,
+                "type": "document"
+            },
+            "metadata_key": "hsbc_sentence_id",
+            "rerun_key": "rerun"
+        },
+        "response_mode": "blocking",
+        "user": "abc-123"
+    }
+
+    workflow_headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    print(f"开始调用 workflow: {workflow_url}")
+    try:
+        workflow_resp = requests.post(
+            workflow_url,
+            json=workflow_body,
+            headers=workflow_headers,
+            timeout=120
+        )
+    except Exception as e:
+        return jsonify({"detail": f"Dify workflow request failed: {type(e).__name__}: {e}"}), 502
+
+    if workflow_resp.status_code >= 400:
+        return jsonify({"detail": f"Dify workflow failed: {workflow_resp.text}"}), workflow_resp.status_code
+
+    try:
+        workflow_json = workflow_resp.json()
+    except Exception as e:
+        return jsonify({"detail": f"Invalid JSON from Dify workflow: {type(e).__name__}: {e}"}), 502
+
+    print("✓ Workflow 执行成功")
+
+    return jsonify({
+        "status": "success",
+        "message": f"Successfully submitted '{file_name_with_ext}' to Dify workflow",
+        "file_name": file_name_with_ext,
+        "file_path": csv_path,
+        "dify_file_id": file_id,
+        "dify_workflow_response": {
+            "workflow_run_id": workflow_json.get("workflow_run_id"),
+            "task_id": workflow_json.get("task_id"),
+            "status": workflow_json.get("data", {}).get("status")
+        }
+    })
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """健康检查接口"""
