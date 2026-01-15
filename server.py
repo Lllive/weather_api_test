@@ -6,6 +6,8 @@ import re
 from dotenv import load_dotenv
 import logging
 import json 
+import mysql.connector
+from opencc import OpenCC
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from flask import Flask, request, jsonify
 load_dotenv()
@@ -24,6 +26,7 @@ app = Flask(__name__)
 PROMPT_FILE = 'prompt_template.txt'
 # 模拟模式 (True=不花钱测试流程, False=真实请求)
 MOCK_MODE = False 
+OPENCC_T2S = OpenCC("t2s")
 
 # 格式：{"name": "显示在Excel的名字", "url": "API地址", "key": "API密钥", "model_id": "传给API的模型参数名"}
 MODELS_CONFIG = [
@@ -204,23 +207,58 @@ def clean_gloss_text(text):
 
 # ================= 数据库 (Mock Database) =================
 #连接 MySQL/PostgreSQL/MongoDB
-#GLOSS_DATABASE = 
+GLOSS_DATABASE = os.getenv("GLOSS_DATABASE")
 
+# 初始化数据库连接
+def init_db():
+    """初始化数据库连接"""
+    try:
+        conn = mysql.connector.connect(
+            host=GLOSS_DATABASE.split(":")[0],
+            port=int(GLOSS_DATABASE.split(":")[1]),
+            user=os.getenv("GLOSS_DB_USER"),
+            password=os.getenv("GLOSS_DB_PASSWORD"),
+            database="sign_language_db"
+        )
+        return conn
+    except mysql.connector.Error as e:
+        print(f"数据库连接失败: {e}")
+        return None
+
+# ================= 数据库查询函数 =================
 def get_id_from_db(word):
-    """
-    模拟查数据库的操作。
-    """
-    # 这里我们造一个假的字典当数据库用
-    mock_db = {
-        "下午": 1001,
-        "5": 1002,
-        "时": 1003,
-        "气温": 1004,
-        "30": 1005,
-        "度": 1006
-    }
+    # """
+    # 模拟查数据库的操作。
+    # """
+    # # 这里我们造一个假的字典当数据库用
+    # mock_db = {
+    #     "下午": 1001,
+    #     "5": 1002,
+    #     "时": 1003,
+    #     "气温": 1004,
+    #     "30": 1005,
+    #     "度": 1006
+    # }
     # 如果找不到，返回 None，或者你可以返回 0
-    return mock_db.get(word, None)
+    # return mock_db.get(word, None)
+    
+    # 实际数据库查询逻辑
+    # version 1.0
+    conn = init_db()
+    if not conn:
+        return None
+    try:
+        normalized = OPENCC_T2S.convert(str(word).strip())
+        with conn.cursor(dictionary=True) as cursor:
+            query = "SELECT word_id FROM search WHERE synonym = %s LIMIT 1"
+            cursor.execute(query, (normalized,))
+            result = cursor.fetchone()
+            return result['word_id'] if result else None
+    except mysql.connector.Error as e:
+        print(f"数据库查询失败: {e}")
+        return None
+    finally:
+        conn.close()
 
 # ================= 通用 API 调用函数 =================
 # 这是一个装饰器，意思是：
@@ -409,4 +447,5 @@ if __name__ == "__main__":
     print(f"🔧 当前使用模型: {MODELS_CONFIG[0]['name']}")
     
     # debug=True 方便开发调试，生产环境建议改为 False
-    app.run(host='127.0.0.1', port=5000, debug=False) 
+    # app.run(host='127.0.0.1', port=5000, debug=False) 
+    app.run(host='0.0.0.0', port=5000, debug=False)
