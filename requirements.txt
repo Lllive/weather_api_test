@@ -6,3 +6,5 @@ Requests==2.32.5
 rouge_score==0.1.2
 sacrebleu==2.5.1
 tenacity==9.1.2
+opencc-python-reimplemented==0.1.7
+mysql-connector-python
