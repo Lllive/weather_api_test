@@ -8,6 +8,8 @@ import logging
 import json 
 import mysql.connector
 from opencc import OpenCC
+import csv
+import fcntl
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from flask import Flask, request, jsonify
 load_dotenv()
@@ -27,6 +29,8 @@ PROMPT_FILE = 'prompt_template.txt'
 # 模拟模式 (True=不花钱测试流程, False=真实请求)
 MOCK_MODE = False 
 OPENCC_T2S = OpenCC("t2s")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+USER_TASK_CSV_PATH = os.path.join(BASE_DIR, "static", "user_task.csv")
 
 # 格式：{"name": "显示在Excel的名字", "url": "API地址", "key": "API密钥", "model_id": "传给API的模型参数名"}
 MODELS_CONFIG = [
@@ -124,6 +128,46 @@ def load_prompt():
     except Exception as e:
         print(f"❌ 读取文件出错: {e}")
         return "" # <--- 改为返回空字符串
+
+def append_user_task_csv(input_text, words, word_ids):
+    os.makedirs(os.path.dirname(USER_TASK_CSV_PATH), exist_ok=True)
+
+    translated_text = " ".join([str(w).strip() for w in (words or []) if str(w).strip()])
+    translated_keypoints = str(list(word_ids or []))
+
+    next_id = 1
+    with open(USER_TASK_CSV_PATH, "a+", encoding="utf-8", newline="") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        f.seek(0)
+        reader = csv.reader(f)
+        rows = [row for row in reader if row]
+        header = ["input_text","translated_text","translated_text_english","translated_keypoints","start_second","end_second","metadata"]
+        if rows:
+            header = rows[0]
+            for row in reversed(rows[1:]):
+                if len(row) < 7:
+                    continue
+                try:
+                    meta = ast.literal_eval(row[6])
+                    next_id = int(meta.get("user_task_id")) + 1
+                    break
+                except Exception:
+                    continue
+
+        if not rows:
+            writer = csv.writer(f)
+            writer.writerow(header)
+
+        metadata = {"user_task_id": str(next_id)}
+        metadata_str = "{'user_task_id': '" + metadata["user_task_id"] + "'}"
+
+        writer = csv.writer(f)
+        writer.writerow([input_text, translated_text, "", translated_keypoints, 1, 1, metadata_str])
+        f.flush()
+        os.fsync(f.fileno())
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+    return next_id
         
 # ================= 核心工具：按标点切分 =================
 def split_text_by_punctuation(text):
@@ -449,6 +493,29 @@ def api_translate():
         
     except Exception as e:
         logging.error(f"Server Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/gen_video', methods=['POST'])
+def api_gen_video():
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Invalid JSON"}), 400
+
+        text = data.get("text", "")
+        words = data.get("words", [])
+        word_ids = data.get("wordsid", data.get("word_ids", []))
+
+        if not isinstance(text, str) or not text.strip():
+            return jsonify({"error": "No text provided"}), 400
+        if not isinstance(words, list) or not isinstance(word_ids, list):
+            return jsonify({"error": "words and wordsid must be lists"}), 400
+
+        task_id = append_user_task_csv(text.strip(), words, word_ids)
+        return jsonify({"status": "ok", "user_task_id": str(task_id)})
+
+    except Exception as e:
+        logging.error(f"User task error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/proxy/content/submit', methods=['POST'])
